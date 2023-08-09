@@ -246,6 +246,9 @@ out on the lattice. Please modify the corresponding WIT file that contains inter
     // Create the implementation struct name as an Ident
     let impl_struct_name = Ident::new_raw(cfg.impl_struct.as_str(), Span::call_site());
 
+    // Build a list of match arms for the interfaces
+    let mut interface_dispatch_match_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+
     let mut iface_tokens = proc_macro2::TokenStream::new();
     for (wit_iface_name, methods) in methods_by_iface.iter() {
         let wit_iface = Ident::new(wit_iface_name, Span::call_site());
@@ -297,14 +300,13 @@ out on the lattice. Please modify the corresponding WIT file that contains inter
 
         // Add the structs for the current interface
         iface_tokens.append_all(quote::quote!(
-            // START => *Invocation structs
+            // START: *Invocation structs & trait for #wit_iface
             #(
                 #[derive(Debug, ::serde::Serialize, ::serde::Deserialize)]
                 struct #struct_names {
                     #struct_members
                 }
             )*
-            // END => *Invocation structs
 
             #[::async_trait::async_trait]
             pub trait #wit_iface {
@@ -316,47 +318,29 @@ out on the lattice. Please modify the corresponding WIT file that contains inter
                     ) #invocation_returns;
                 )*
             }
+            // END: *Invocation structs & trait for #wit_iface
+        ));
 
-            /// MessageDispatch ensures that your provider can receive and
-            /// process messages sent to it over the lattice
-            ///
-            /// This implementation is a stub and must be filled out by implementers
-            ///
-            /// It would be preferable to use <T: SomeTrait> here, but the fact that  'd like to use
-            #[::async_trait::async_trait]
-            impl ::wasmcloud_provider_sdk::MessageDispatch for #impl_struct_name {
-                async fn dispatch<'a>(
-                    &'a self,
-                    ctx: ::wasmcloud_provider_sdk::Context,
-                    method: String,
-                    body: std::borrow::Cow<'a, [u8]>,
-                ) -> Result<Vec<u8>, ::wasmcloud_provider_sdk::error::ProviderInvocationError> {
-                    match method.as_str() {
+        // After building individual invocation structs and traits for each interface
+        // we must build & hold on to the usage of these inside the match for the MessageDispatch trait
+        interface_dispatch_match_arms.push(quote::quote!(
+            #(
+                #lattice_method_names => {
+                    let input: #struct_names = ::wasmcloud_provider_sdk::deserialize(&body)?;
+                    let result = #wit_iface::#func_names(
+                        self,
+                        ctx,
                         #(
-                            #lattice_method_names => {
-                                let input: #struct_names = ::wasmcloud_provider_sdk::deserialize(&body)?;
-                                let result = #wit_iface::#func_names(
-                                    self,
-                                    ctx,
-                                    #(
-                                        input.#invocation_args,
-                                    )*
-                                )
-                                    .await
-                                    .map_err(|e| {
-                                        ::wasmcloud_provider_sdk::error::ProviderInvocationError::Provider(e.to_string())
-                                    })?;
-                                Ok(::wasmcloud_provider_sdk::serialize(&result)?)
-                            }
+                            input.#invocation_args,
                         )*
-                        _ => Err(::wasmcloud_provider_sdk::error::InvocationError::Malformed(format!(
-                            "Invalid method name {method}",
-                        ))
-                                 .into()),
-                    }
+                    )
+                        .await
+                        .map_err(|e| {
+                            ::wasmcloud_provider_sdk::error::ProviderInvocationError::Provider(e.to_string())
+                        })?;
+                    Ok(::wasmcloud_provider_sdk::serialize(&result)?)
                 }
-            }
-
+            )*
         ));
     }
 
@@ -366,7 +350,35 @@ out on the lattice. Please modify the corresponding WIT file that contains inter
         #bindgen_ast
         // END: wit-bidngen output
 
+        // START: per-interface codegen
         #iface_tokens
+        // END: per-interface codegen
+
+        /// MessageDispatch ensures that your provider can receive and
+        /// process messages sent to it over the lattice
+        ///
+        /// This implementation is a stub and must be filled out by implementers
+        ///
+        /// It would be preferable to use <T: SomeTrait> here, but the fact that  'd like to use
+        #[::async_trait::async_trait]
+        impl ::wasmcloud_provider_sdk::MessageDispatch for #impl_struct_name {
+            async fn dispatch<'a>(
+                &'a self,
+                ctx: ::wasmcloud_provider_sdk::Context,
+                method: String,
+                body: std::borrow::Cow<'a, [u8]>,
+            ) -> Result<Vec<u8>, ::wasmcloud_provider_sdk::error::ProviderInvocationError> {
+                match method.as_str() {
+                    #(
+                        #interface_dispatch_match_arms
+                    )*
+                    _ => Err(::wasmcloud_provider_sdk::error::InvocationError::Malformed(format!(
+                        "Invalid method name {method}",
+                    ))
+                             .into()),
+                }
+            }
+        }
 
         // START: general provider
 
@@ -403,7 +415,6 @@ out on the lattice. Please modify the corresponding WIT file that contains inter
         /// Given the implementation of ProviderHandler and MessageDispatch,
         /// the implementation for your struct is a guaranteed
         impl ::wasmcloud_provider_sdk::Provider for #impl_struct_name {}
-
 
         /// This handler serves to be used for individual invocations of the actor
         /// as performed by the host runtime
